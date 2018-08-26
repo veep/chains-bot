@@ -118,7 +118,7 @@ sub cleanup_item {
 
     my @copy_keys = (
         qw(
-              title_suggest publisher edition_key
+              title_suggest publisher edition_key key
               author_name subject first_publish_year publish_year first_publish_date
               publish_date author_key type place language cover_edition_key
       ));
@@ -312,6 +312,9 @@ sub post_item {
       @reply = (in_reply_to_id => $state->{last_item_id});
   }
   $text .= 'by ' . join(' & ',@{$item->{author_name}}) . "\n";
+  if ($item->{key} && $item->{key} =~ m,^/works/,) {
+      $text .= "https://openlibrary.org" . $item->{key};
+  }
   if (! $SKIP_TOOT) {
       if ($text && $media_id->{id}) {
           $status = $client->post_status
