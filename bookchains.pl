@@ -8,13 +8,16 @@ use File::Basename qw/fileparse/;
 use File::Temp qw/ tempfile /;
 use IO::All qw/io/;
 use JSON::PP;
+use List::Util qw/shuffle/;
 use Mastodon::Client;
+use sort 'stable';
 
 my $DEBUG = 1;
 
 main();
 sub main {
     my $state = load_state();
+    $state->{connections} //= [];
 
     if (my $reason = should_we_exit($state)) {
         warn "Exiting without posting:\n$reason\n";
@@ -31,7 +34,7 @@ sub main {
     } until item_validates($next_item);
 
     post_item($state, $next_item);
-    save_state($state, $next_item);
+    save_state($state);
 }
 
 
@@ -51,7 +54,13 @@ sub load_state {
     }
     return {};
 }
-sub save_state {}
+sub save_state {
+    my ($state) = @_;
+    my $filename = state_file();
+    if (-w $filename) {
+        encode_json $state > io($filename);
+    }
+}
 
 sub seed_is_due {
     my $state = shift;
@@ -78,6 +87,8 @@ sub validated_seed {
             $seed = mark_as_seed($seed);
 #            DEBUG('clean object', $seed);
             if (item_validates($seed)) {
+                $state->{seed_is_due} = 0;
+                $state->{chain_length} = 1;
                 return $seed;
             }
         }
@@ -110,27 +121,87 @@ sub cleanup_item {
 }
 
 
-sub next_from_state {}
+sub next_from_state {
+    my ($state) = @_;
+    my @connections = shuffle(
+        qw(
+              author year title place publisher subject
+      ));
+    my %weights;
+    for my $connection_number (0..2) {
+        if ($state->{connections}[$connection_number]) {
+            $weights{$state->{connections}[$connection_number]} = 10-$connection_number;
+        }
+    }
+    @connections = sort { ($weights{$a} // 0) <=> ($weights{$b} // 0)} @connections;
+    DEBUG('connections order', \@connections);
+    for my $connection (@connections) {
+        if ($connection eq 'author'
+            || $connection eq 'subject'
+            || $connection eq 'publisher'
+            || $connection eq 'place'
+        ) {
+            DEBUG("trying to use '$connection'");
+            my $key = $connection;
+            $key = 'author_key' if $connection eq 'author';
+            my $search_key = $connection;
+            next unless ref($state->{last_item}{$key}) eq 'ARRAY';
+            for my $list_item (@{$state->{last_item}{$key}}) {
+                DEBUG("trying $connection",$list_item);
+                my $results < io('http://openlibrary.org/search.json?'
+                                 . $search_key . '=' . $list_item);
+                my $parsed_results = decode_json $results;
+                DEBUG("number found",$parsed_results->{num_found});
+                if ($parsed_results->{num_found} > 1) {
+                    my @books = shuffle @{$parsed_results->{docs}};
+                    for my $book (@books) {
+                        next if $book->{cover_edition_key} eq $state->{last_item}{cover_edition_key};
+                        if (item_validates($book)) {
+                            unshift(@{$state->{connections}},$connection);
+                            return $book;
+                        }
+                    }
+                }
+            }
+        }
+        DEBUG("failed to use $connection");
+    }
+    # We're giving up
+    $state->{chain_length} = 0;
+    $state->{seed_is_due} = 1;
+    return {};
+}
+
 sub item_validates {
     my $item = shift;
     if (! exists $item->{cover_edition_key}) {
-	return 0;
-      }
+        return 0;
+    }
+    if (ref($item->{language}) eq 'ARRAY') {
+        if (! grep {$_ eq 'eng'} @{$item->{language}}) {
+            DEBUG('Bad Languages',$item->{language});
+            return 0;
+        }
+    } else {
+        DEBUG('missing language');
+        return 0;
+    }
     if (! exists $item->{cover_image}) {
-      my $url = 	'http://covers.openlibrary.org/b/olid/'
-	. $item->{cover_edition_key}
-	. '-M.jpg';
-      DEBUG('cover image',$url);
-      my $image < io($url );
-      DEBUG('image length',length($image));
-      $item->{cover_image} = $image;
+        my $url = 	'http://covers.openlibrary.org/b/olid/'
+        . $item->{cover_edition_key}
+        . '-M.jpg';
+        DEBUG('cover image',$url);
+        my $image < io($url );
+        DEBUG('image length',length($image));
+        $item->{cover_image} = $image;
     }
     if (length($item->{cover_image}) < 1000) {
-      return 0;
+        return 0;
     }
     DEBUG("validated");
     return 1;
 }
+
 sub post_item {
   my ($state, $item) = @_;
   my $filename = "./tempfile";
@@ -143,31 +214,53 @@ sub post_item {
 
   my $client = Mastodon::Client->new
     (
-     instance        => 'botsin.space',
-     name            => 'BookChains',
-     client_id       => $client_id,
-     client_secret   => $client_secret,
-     access_token    => $access_token,
-     coerce_entities => 0,
+        instance        => 'botsin.space',
+        name            => 'BookChains',
+        client_id       => $client_id,
+        client_secret   => $client_secret,
+        access_token    => $access_token,
+        coerce_entities => 0,
     );
-  my $media_id= $client->upload_media($filename);
+  my $title_text = ($item->{title_suggest} // $item->{title});
+  my $media_id= $client->upload_media(
+      $filename,
+      "Cover image for '$title_text' from openlibrary.org",
+      '0,1'
+  );
   DEBUG('media_id',$media_id);
-  my $text;
+  my ($text,$status,@reply);
   if ($item->{is_seed}) {
-    $text = "Let's start a new chain with '" .
-      ($item->{title_suggest} // $item->{title}) . "'\n";
-    $text .= 'by ' . join(' & ',@{$item->{author_name}}) . "\n";
-    if ($text && $media_id->{id}) {
-      my $status = $client->post_status
-	(
-	 $text,
-	 {
-	  visibility => 'unlisted',
-	  media_ids => [$media_id->{id}],
-	 }
-	);
-      DEBUG('return status',$status);
-    }
+      $text = "Let's start a new chain with '" . $title_text . "'\n";
+  } else {
+      $text = "Let's continue the chain from '" .
+      ( $state->{last_item}{title_suggest} // $state->{last_item}{title}) .
+      "', via a shared " . $state->{connections}[0] . ", with '"
+      . $title_text . "'\n";
+      @reply = (in_reply_to_id => $state->{last_item_id});
+  }
+  $text .= 'by ' . join(' & ',@{$item->{author_name}}) . "\n";
+  if ($text && $media_id->{id}) {
+      $status = $client->post_status
+      (
+          $text,
+          {
+              visibility => 'unlisted',
+              media_ids => [$media_id->{id}],
+              @reply,
+          }
+      );
+      #          DEBUG('return status',$status);
+  }
+
+  delete $item->{cover_image};  # No need to save this
+  if ($status && $status->{id}) {
+      $state->{last_item} = $item;
+      $state->{last_item_id} = $status->{id};
+      $state->{chain_length}++;
+      if ($state->{chain_length} > $state->{max_chain_length}) {
+          $state->{chain_length} = 0;
+          $state->{seed_is_due} = 1;
+      }
   }
 }
 
