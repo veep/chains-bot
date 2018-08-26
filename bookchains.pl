@@ -285,6 +285,10 @@ sub post_item {
       );
   }
   my $title_text = ($item->{title_suggest} // $item->{title});
+  if (length($title_text) > 60) {
+      DEBUG("Truncating title text",$title_text,substr($title_text,0,56));
+      $title_text=substr($title_text,0,56) . ' ...';
+  }
   my $media_id;
   if (! $SKIP_TOOT) {
       $media_id= $client->upload_media(
