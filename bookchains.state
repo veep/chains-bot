@@ -1,11 +1,12 @@
 {
+    "max_chain_length": 24, 
     "seed_is_due": true,
     "unused_seeds": [
+        "9780262610414",
         "OL8662045M",
         "OL5795847M",
-        "OL25941433M",
-        "9780262610414",
         "OL21456142M"
+        "OL25941433M",
     ],
     "used_seeds": [
     ]
