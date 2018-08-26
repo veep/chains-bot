@@ -14,10 +14,13 @@ use sort 'stable';
 
 my $DEBUG = 1;
 
+my $SKIP_TOOT = 0;
+
 main();
 sub main {
     my $state = load_state();
     $state->{connections} //= [];
+    $state->{covers_seen} //= {};
 
     if (my $reason = should_we_exit($state)) {
         warn "Exiting without posting:\n$reason\n";
@@ -79,16 +82,23 @@ sub validated_seed {
     ) {
         my $seed_id = shift @{$state->{unused_seeds}};
         push @{$state->{used_seeds}}, $seed_id;
-        my $results < io('http://openlibrary.org/search.json?q=' . $seed_id);
-#        DEBUG('http get',$results);
-        my $parsed_results = decode_json $results;
+        my $parsed_results;
+        eval {
+            my $results < io('http://openlibrary.org/search.json?q=' . $seed_id);
+            #        DEBUG('http get',$results);
+            $parsed_results = decode_json $results;
+        };
+        if ($@) {
+            DEBUG("Skipping $seed_id",$@);
+            next;
+        }
         if ($parsed_results->{num_found} > 0) {
             my $seed = cleanup_item($parsed_results->{docs}[0]);
             $seed = mark_as_seed($seed);
 #            DEBUG('clean object', $seed);
             if (item_validates($seed)) {
                 $state->{seed_is_due} = 0;
-                $state->{chain_length} = 1;
+                $state->{chain_length} = 0;
                 return $seed;
             }
         }
@@ -155,9 +165,58 @@ sub next_from_state {
                 if ($parsed_results->{num_found} > 1) {
                     my @books = shuffle @{$parsed_results->{docs}};
                     for my $book (@books) {
-                        next if $book->{cover_edition_key} eq $state->{last_item}{cover_edition_key};
+                        next if $state->{covers_seen}{$book->{cover_edition_key}};
                         if (item_validates($book)) {
                             unshift(@{$state->{connections}},$connection);
+                            $state->{connection_value} = $list_item;
+                            return $book;
+                        }
+                    }
+                }
+            }
+        } elsif ($connection eq 'year') {
+            DEBUG("trying to use '$connection'");
+            my $key = 'first_publish_year';
+            if ($state->{last_item}{$key}) {
+                DEBUG("trying $connection",$state->{last_item}{$key});
+                my $results < io('http://openlibrary.org/search.json?'
+                                 . 'q=' . $state->{last_item}{$key});
+                my $parsed_results = decode_json $results;
+                DEBUG("number found",$parsed_results->{num_found});
+                if ($parsed_results->{num_found} > 1) {
+                    my @books = shuffle @{$parsed_results->{docs}};
+                    for my $book (@books) {
+                        next if $state->{covers_seen}{$book->{cover_edition_key}};
+                        next unless $book->{$key} eq $state->{last_item}{$key};
+                        if (item_validates($book)) {
+                            unshift(@{$state->{connections}},$connection);
+                            $state->{connection_value} = $state->{last_item}{$key};
+                            return $book;
+                        }
+                    }
+                }
+            }
+        } elsif ($connection eq 'title') {
+            DEBUG("trying to use '$connection'");
+            my $title_text = ($state->{last_item}{title_suggest} // $state->{last_item}{title});
+            DEBUG("trying $connection",$title_text);
+            for my $word (shuffle (lc($title_text) =~ /(\w+)/g)) {
+                DEBUG("trying word",$word);
+                my $results < io('http://openlibrary.org/search.json?'
+                                 . 'q=' . $word);
+                my $parsed_results = decode_json $results;
+                DEBUG("number found",$parsed_results->{num_found});
+                next if $parsed_results->{num_found} > 50000;
+                if ($parsed_results->{num_found} > 1) {
+                    my @books = shuffle @{$parsed_results->{docs}};
+                    for my $book (@books) {
+                        next if $state->{covers_seen}{$book->{cover_edition_key}};
+                        next unless $book->{title_suggest};
+                        DEBUG('checking title',$book->{title_suggest});
+                        next unless $book->{title_suggest} =~ /\b$word\b/i;
+                        if (item_validates($book)) {
+                            unshift(@{$state->{connections}},$connection);
+                            $state->{connection_value} = $word;
                             return $book;
                         }
                     }
@@ -212,55 +271,76 @@ sub post_item {
   my $client_secret = $secrets->{client_secret};
   my $access_token = $secrets->{access_token};
 
-  my $client = Mastodon::Client->new
-    (
-        instance        => 'botsin.space',
-        name            => 'BookChains',
-        client_id       => $client_id,
-        client_secret   => $client_secret,
-        access_token    => $access_token,
-        coerce_entities => 0,
-    );
+  my $client;
+  if (! $SKIP_TOOT) {
+      $client = Mastodon::Client->new
+      (
+          instance        => 'botsin.space',
+          name            => 'BookChains',
+          client_id       => $client_id,
+          client_secret   => $client_secret,
+          access_token    => $access_token,
+          coerce_entities => 0,
+      );
+  }
   my $title_text = ($item->{title_suggest} // $item->{title});
-  my $media_id= $client->upload_media(
-      $filename,
-      "Cover image for '$title_text' from openlibrary.org",
-      '0,1'
-  );
-  DEBUG('media_id',$media_id);
+  my $media_id;
+  if (! $SKIP_TOOT) {
+      $media_id= $client->upload_media(
+          $filename,
+          "Cover image for '$title_text' from openlibrary.org",
+          '0,1'
+      );
+      DEBUG('media_id',$media_id);
+  }
   my ($text,$status,@reply);
   if ($item->{is_seed}) {
       $text = "Let's start a new chain with '" . $title_text . "'\n";
   } else {
+      my $shared_text;
+      if ($state->{connections}[0] eq 'author') {
+          $shared_text = 'a shared author';
+      } elsif ($state->{connections}[0] eq 'title') {
+          $shared_text = "the shared title word '" . $state->{connection_value} ."'";
+      } else {
+          $shared_text = "the shared " . $state->{connections}[0] . " '" . $state->{connection_value} ."'";
+      }
       $text = "Let's continue the chain from '" .
       ( $state->{last_item}{title_suggest} // $state->{last_item}{title}) .
-      "', via a shared " . $state->{connections}[0] . ", with '"
+      "', via " . $shared_text . ".\nNext up is '"
       . $title_text . "'\n";
       @reply = (in_reply_to_id => $state->{last_item_id});
   }
   $text .= 'by ' . join(' & ',@{$item->{author_name}}) . "\n";
-  if ($text && $media_id->{id}) {
-      $status = $client->post_status
-      (
-          $text,
-          {
-              visibility => 'unlisted',
-              media_ids => [$media_id->{id}],
-              @reply,
-          }
-      );
-      #          DEBUG('return status',$status);
+  if (! $SKIP_TOOT) {
+      if ($text && $media_id->{id}) {
+          $status = $client->post_status
+          (
+              $text,
+              {
+                  visibility => 'public',
+                  media_ids => [$media_id->{id}],
+                  @reply,
+              }
+          );
+          #          DEBUG('return status',$status);
+      }
+  } else {
+      use Data::Dump qw/ddx/;
+      ddx ['Would have posted',$text];
+      $status = { id => rand(1000000) };
   }
 
   delete $item->{cover_image};  # No need to save this
   if ($status && $status->{id}) {
       $state->{last_item} = $item;
-      $state->{last_item_id} = $status->{id};
+      $state->{last_item_id} = '' . $status->{id};
       $state->{chain_length}++;
-      if ($state->{chain_length} > $state->{max_chain_length}) {
+      if ($state->{chain_length} >= $state->{max_chain_length}) {
           $state->{chain_length} = 0;
           $state->{seed_is_due} = 1;
       }
+      $state->{covers_seen}{$item->{cover_edition_key}} = scalar time;
   }
 }
 
