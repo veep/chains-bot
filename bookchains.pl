@@ -162,6 +162,7 @@ sub next_from_state {
                                  . $search_key . '=' . $list_item);
                 my $parsed_results = decode_json $results;
                 DEBUG("number found",$parsed_results->{num_found});
+                next if  $parsed_results->{num_found} > 50000 && $connection eq 'subject';
                 if ($parsed_results->{num_found} > 1) {
                     my @books = shuffle @{$parsed_results->{docs}};
                     for my $book (@books) {
