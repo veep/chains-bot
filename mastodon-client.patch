@@ -1,0 +1,25 @@
+--- Client.pm~	2018-04-21 18:36:44.000000000 -0700
++++ Client.pm	2018-08-25 16:34:16.820573023 -0700
+@@ -440,13 +440,19 @@
+ sub upload_media {
+   my $self = shift;
+ 
++  my ($filename,$caption,$focus) = @_;
++
+   state $check = compile(
+     File->plus_coercions( Str, sub { Path::Tiny::path($_) } )
+   );
+-  my ($file) = $check->(@_);
++  my ($file) = $check->($filename);
+ 
+-  return $self->post( 'media' =>
+-    { file => [ $file, undef ] },
++  return $self->post(
++      'media' =>
++      { file => [ $file, undef ],
++        (defined($caption) ? (description => $caption) : ()),
++        (defined($focus) ? (focus => $focus) : ()),
++    },
+     headers => { Content_Type => 'form-data' },
+   );
+ }
