@@ -13,7 +13,7 @@ Running at https://botsin.space/@BookChains
 At least:
 
 * Perl
-* Mastodon::Client
+* Mastodon::Client (patched with the included patch, if you want alt text and improved focus)
 * IO::All
 * IO::All::LWP
 * Data::Dump
