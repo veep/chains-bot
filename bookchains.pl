@@ -292,9 +292,11 @@ sub post_item {
   my $media_id;
   if (! $SKIP_TOOT) {
       $media_id= $client->upload_media(
-          $filename,
-          "Cover image for '$title_text' from openlibrary.org",
-          '0,1'
+        $filename,
+        {
+          description => "Cover image for '$title_text' from openlibrary.org",
+          focus => [0,1],
+        },
       );
       DEBUG('media_id',$media_id);
   }
